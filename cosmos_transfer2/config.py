@@ -339,7 +339,11 @@ class CommonInferenceArguments(pydantic.BaseModel):
         """
         # Load data from file
         if path.suffix in [".json"]:
-            data_list = [json.loads(path.read_text())]
+            content = json.loads(path.read_text())
+            if isinstance(content, list):
+                data_list = content
+            else:
+                data_list = [content]
         elif path.suffix in [".jsonl"]:
             data_list = [json.loads(line) for line in path.read_text().splitlines()]
         else:
