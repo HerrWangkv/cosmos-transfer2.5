@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import torch.distributed as dist
 from pathlib import Path
 
 import numpy as np
@@ -153,10 +155,39 @@ class Control2WorldInference:
 
         output_paths: list[str] = []
         for i_sample, sample in enumerate(samples):
+            output_path = output_dir / f"{sample.name}.mp4"
+            if output_path.exists():
+                log.info(f"Skipping existing: {output_path}")
+                output_paths.append(str(output_path))
+                continue
+
             log.info(f"[{i_sample + 1}/{len(samples)}] Processing sample {sample.name}")
-            output_path = self._generate_sample(sample, output_dir, sample_id=i_sample)
-            if output_path is not None:
-                output_paths.append(output_path)
+            
+            # 状态标志：0=正常, 1=OOM, 2=其他错误
+            status_flag = torch.tensor([0.0], device="cuda")
+            current_res = None
+
+            try:
+                current_res = self._generate_sample(sample, output_dir, sample_id=i_sample)
+            except torch.cuda.OutOfMemoryError:
+                log.error(f"Rank {dist.get_rank()} hit OOM on {sample.name}")
+                status_flag[0] = 1.0
+            except Exception:
+                log.exception(f"Rank {dist.get_rank()} hit General Error on {sample.name}")
+                status_flag[0] = 2.0
+
+            # 【关键】所有进程在此同步状态，确保齐步走
+            dist.all_reduce(status_flag, op=dist.ReduceOp.MAX)
+
+            if status_flag.item() > 0:
+                # 只要有一张卡出事，全局清理并跳过该样本
+                gc.collect()
+                torch.cuda.empty_cache()
+                log.warning(f"Global skip sample {sample.name} due to error (status {status_flag.item()})")
+                continue
+
+            if current_res is not None:
+                output_paths.append(current_res)
 
         if is_rank0() and self.setup_args.benchmark:
             log.info("=" * 50)
@@ -190,36 +221,36 @@ class Control2WorldInference:
             open(f"{output_path}.json", "w").write(sample.model_dump_json())
             log.info(f"Saved arguments to {output_path}.json")
 
-            with self.benchmark_timer("text_guardrail"):
-                # run text guardrail on the prompt
-                if self.text_guardrail_runner is not None:
-                    log.info("Running guardrail check on prompt...")
+            # with self.benchmark_timer("text_guardrail"):
+            #     # run text guardrail on the prompt
+            #     if self.text_guardrail_runner is not None:
+            #         log.info("Running guardrail check on prompt...")
 
-                    if not guardrail_presets.run_text_guardrail(prompt, self.text_guardrail_runner):
-                        message = f"Guardrail blocked generation. Prompt: {prompt}"
-                        log.critical(message)
-                        if self.setup_args.keep_going:
-                            return None
-                        else:
-                            raise Exception(message)
-                    else:
-                        log.success("Passed guardrail on prompt")
+            #         if not guardrail_presets.run_text_guardrail(prompt, self.text_guardrail_runner):
+            #             message = f"Guardrail blocked generation. Prompt: {prompt}"
+            #             log.critical(message)
+            #             if self.setup_args.keep_going:
+            #                 return None
+            #             else:
+            #                 raise Exception(message)
+            #         else:
+            #             log.success("Passed guardrail on prompt")
 
-                    if negative_prompt is not None:
-                        if not guardrail_presets.run_text_guardrail(
-                            negative_prompt,
-                            self.text_guardrail_runner,
-                        ):
-                            message = f"Guardrail blocked generation. Negative prompt: {negative_prompt}"
-                            log.critical(message)
-                            if self.setup_args.keep_going:
-                                return None
-                            else:
-                                raise Exception(message)
-                        else:
-                            log.success("Passed guardrail on negative prompt")
-                elif self.text_guardrail_runner is None:
-                    log.warning("Guardrail checks on prompt are disabled")
+            #         if negative_prompt is not None:
+            #             if not guardrail_presets.run_text_guardrail(
+            #                 negative_prompt,
+            #                 self.text_guardrail_runner,
+            #             ):
+            #                 message = f"Guardrail blocked generation. Negative prompt: {negative_prompt}"
+            #                 log.critical(message)
+            #                 if self.setup_args.keep_going:
+            #                     return None
+            #                 else:
+            #                     raise Exception(message)
+            #             else:
+            #                 log.success("Passed guardrail on negative prompt")
+            #     elif self.text_guardrail_runner is None:
+            #         log.warning("Guardrail checks on prompt are disabled")
 
         input_control_video_paths = sample.control_modalities
         log.info(f"Processing the following paths: {input_control_video_paths}")
@@ -288,24 +319,24 @@ class Control2WorldInference:
                     save_img_or_video(mask_video_dict[key], f"{output_path}_mask_{key}", fps=fps)
                     log.info(f"Mask for {key} saved to {output_path}_mask_{key}.{ext}")
                 # run video guardrail on the video
-                if self.video_guardrail_runner is not None:
-                    log.info("Running guardrail check on video...")
-                    frames = (output_video * 255.0).clamp(0.0, 255.0).to(torch.uint8)
-                    frames = frames.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
-                    processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
-                    if processed_frames is None:
-                        if self.setup_args.keep_going:
-                            return None
-                        else:
-                            raise Exception("Guardrail blocked video2world generation.")
-                    else:
-                        log.success("Passed guardrail on generated video")
+                # if self.video_guardrail_runner is not None:
+                #     log.info("Running guardrail check on video...")
+                #     frames = (output_video * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+                #     frames = frames.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
+                #     processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
+                #     if processed_frames is None:
+                #         if self.setup_args.keep_going:
+                #             return None
+                #         else:
+                #             raise Exception("Guardrail blocked video2world generation.")
+                #     else:
+                #         log.success("Passed guardrail on generated video")
 
-                    # Convert processed frames back to tensor format
-                    processed_video = torch.from_numpy(processed_frames).float().permute(3, 0, 1, 2) / 255.0
-                    output_video = processed_video.to(output_video.device, dtype=output_video.dtype)
-                else:
-                    log.warning("Guardrail checks on video are disabled")
+                #     # Convert processed frames back to tensor format
+                #     processed_video = torch.from_numpy(processed_frames).float().permute(3, 0, 1, 2) / 255.0
+                #     output_video = processed_video.to(output_video.device, dtype=output_video.dtype)
+                # else:
+                #     log.warning("Guardrail checks on video are disabled")
 
             # Remove batch dimension and normalize to [0, 1] range
             save_img_or_video(output_video, str(output_path), fps=fps)

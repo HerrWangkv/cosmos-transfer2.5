@@ -2,7 +2,7 @@
 .git
 /checkpoints
 /datasets
-/output
+/outputs
 /examples/**/checkpoints
 /examples/**/output
 /examples/**/datasets
